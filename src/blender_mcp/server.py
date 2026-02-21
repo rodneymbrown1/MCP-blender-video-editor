@@ -15,7 +15,7 @@ from pathlib import Path
 import base64
 
 # SDK imports
-from sdk.core.frame import Slide, SlideCollection, SlideStyleProps
+from sdk.core.slides import Slide, SlideCollection, SlideStyleProps
 from sdk.core.workspace import Workspace, AssetMetadata
 from sdk.core.state import SessionState, StylePreset, BUILTIN_PRESETS
 from sdk.intake.audio import AudioTranscriber

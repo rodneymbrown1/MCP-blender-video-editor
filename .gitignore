@@ -21,3 +21,4 @@ src/sdk/tests/artifacts/
 
 # Whisper models cache
 .cache/
+notes_ignore/

@@ -1,36 +1,10 @@
-"""Slide data models for video draft projects."""
+"""Ordered collection of slides with CRUD operations."""
 
-import uuid
 from typing import Optional
 from pydantic import BaseModel, Field
 
-
-class SlideStyleProps(BaseModel):
-    """Visual style properties for a slide."""
-    font_family: str = "Bfont"
-    font_size_title: int = 72
-    font_size_body: int = 36
-    font_color: str = "#FFFFFF"
-    background_color: str = "#1A1A2E"
-    text_alignment: str = "center"
-    padding: int = 40
-
-
-class Slide(BaseModel):
-    """A single slide in a video draft."""
-    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
-    order: int = 0
-    start_time: float = 0.0
-    end_time: float = 0.0
-    title: str = ""
-    body_text: str = ""
-    speaker_notes: str = ""
-    background_image_ref: Optional[str] = None
-    style_overrides: Optional[SlideStyleProps] = None
-
-    @property
-    def duration(self) -> float:
-        return self.end_time - self.start_time
+from .styles import SlideStyleProps
+from .slide import Slide
 
 
 class SlideCollection(BaseModel):

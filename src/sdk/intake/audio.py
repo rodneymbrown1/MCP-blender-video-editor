@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from ..core.frame import Slide, SlideCollection
+from ..core.slides import Slide, SlideCollection
 
 logger = logging.getLogger("VideoDraftMCP.intake.audio")
 

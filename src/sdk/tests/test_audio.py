@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from sdk.core.frame import Slide, SlideCollection
+from sdk.core.slides import Slide, SlideCollection
 from sdk.intake.audio import AudioTranscriber
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "audio"

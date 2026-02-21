@@ -4,7 +4,8 @@ import json
 from typing import Optional
 from pydantic import BaseModel, Field
 
-from .frame import SlideCollection, SlideStyleProps
+from .slides import SlideCollection, SlideStyleProps
+from .slides.templates import TemplateLibrary
 from .workspace import Workspace
 
 
@@ -70,6 +71,7 @@ class SessionState(BaseModel):
     workspace: Optional[Workspace] = None
     slides: SlideCollection = Field(default_factory=SlideCollection)
     undo_stack: list[UndoEntry] = Field(default_factory=list)
+    templates: TemplateLibrary = Field(default_factory=TemplateLibrary)
     whisper_model_size: str = "base"
     transcript_cache: Optional[str] = None
 

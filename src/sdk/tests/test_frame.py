@@ -3,7 +3,7 @@
 import json
 import pytest
 
-from sdk.core.frame import Slide, SlideCollection, SlideStyleProps
+from sdk.core.slides import Slide, SlideCollection, SlideStyleProps
 
 
 # ── SlideStyleProps ─────────────────────────────────────────────────────
