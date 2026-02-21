@@ -27,7 +27,7 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 - Support for Poly Haven assets through their API
 - Support to generate 3D models using Hyper3D Rodin
 - Run Blender MCP on a remote host
-- Telemetry for tools executed (completely anonymous)
+- Telemetry removed (this fork collects no data)
 
 ### Installating a new version (existing users)
 - For newcomers, you can go straight to Installation. For existing users, see the points below
@@ -231,51 +231,83 @@ Hyper3D's free trial key allows you to generate a limited number of models per d
 - **Have you tried turning it off and on again?**: If you're still having connection errors, try restarting both Claude and the Blender server
 
 
-## Technical Details
+## Architecture
+
+### High-Level Overview
+
+```
+Claude (Desktop / Cursor / VS Code)
+        │
+        ▼
+   MCP Client (stdio)
+        │
+        ▼
+   MCP Server  (src/blender_mcp/server.py)
+        │  JSON over TCP socket (localhost:9876)
+        ▼
+   Blender Addon  (addon.py)
+        │
+        ▼
+   Blender Python API (bpy)
+```
+
+### Components
+
+**MCP Server (`src/blender_mcp/server.py`)**
+- Built on the **FastMCP** framework, launched via the `blender-mcp` CLI entry point
+- Exposes **30+ tools** to the AI client (scene inspection, code execution, asset downloads, AI 3D generation)
+- Manages a persistent `BlenderConnection` that sends JSON commands over TCP and handles chunked responses with a 180s timeout
+
+**Blender Addon (`addon.py`)**
+- Registers as a standard Blender addon with a UI panel in the 3D View sidebar
+- Runs a **TCP socket server** on a background thread, accepting JSON commands from the MCP server
+- Routes commands to handler methods, which are scheduled on **Blender's main thread** via `bpy.app.timers.register()` (required for thread safety with `bpy`)
+- Some handlers are always available (scene info, code execution), others are **conditionally enabled** via UI checkboxes (Poly Haven, Sketchfab, Hyper3D, Hunyuan3D)
 
 ### Communication Protocol
 
-The system uses a simple JSON-based protocol over TCP sockets:
+The system uses a JSON-based protocol over TCP sockets:
 
-- **Commands** are sent as JSON objects with a `type` and optional `params`
-- **Responses** are JSON objects with a `status` and `result` or `message`
+```json
+// Request (server → addon)
+{"type": "get_scene_info", "params": {}}
+
+// Response (addon → server)
+{"status": "success", "result": { ... }}
+```
+
+### Tool Categories
+
+| Category | Examples | Notes |
+|---|---|---|
+| **Scene inspection** | `get_scene_info`, `get_object_info`, `get_viewport_screenshot` | Core, always available |
+| **Code execution** | `execute_blender_code` | Runs arbitrary Python in Blender |
+| **Poly Haven** | `search_polyhaven_assets`, `download_polyhaven_asset`, `set_texture` | Free CC0 HDRIs, textures, models |
+| **Sketchfab** | `search_sketchfab_models`, `download_sketchfab_model` | Community 3D models with auto-scaling |
+| **Hyper3D / Rodin** | `generate_hyper3d_model_via_text`, `poll_rodin_job_status` | AI text/image-to-3D (async polling) |
+| **Hunyuan3D** | `generate_hunyuan3d_model`, `poll_hunyuan_job_status` | Tencent AI 3D generation (async polling) |
+
+### Request-Response Lifecycle
+
+1. Claude invokes an MCP tool (e.g. `get_scene_info`)
+2. The MCP server builds a JSON command and sends it over the TCP socket to the Blender addon
+3. The addon's background thread receives the command and schedules the handler on **Blender's main thread** via `bpy.app.timers.register()`
+4. The handler executes Blender API calls (`bpy.data`, `bpy.ops`, etc.) and builds a result
+5. The result is serialized as JSON and sent back over the socket
+6. The MCP server parses the response and returns it to the AI client
+
+### Key Design Decisions
+
+- **Socket-based IPC** rather than embedding the MCP server inside Blender — keeps the server process independent and avoids Blender's GIL/threading constraints
+- **Main-thread execution** via timers — all Blender API calls are safely dispatched to the main thread since `bpy` is not thread-safe
+- **Conditional command registration** — integrations (Poly Haven, Sketchfab, Hyper3D, Hunyuan3D) are only active when the user explicitly enables them in the Blender UI panel
+- **Async polling pattern** for AI generation tools — create job → poll status → import result, since 3D generation can take significant time
 
 ## Limitations & Security Considerations
 
 - The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. ALWAYS save your work before using it.
 - Poly Haven requires downloading models, textures, and HDRI images. If you do not want to use it, please turn it off in the checkbox in Blender. 
 - Complex operations might need to be broken down into smaller steps
-
-
-#### Telemetry Control
-
-BlenderMCP collects anonymous usage data to help improve the tool. You can control telemetry in two ways:
-
-1. **In Blender**: Go to Edit > Preferences > Add-ons > Blender MCP and uncheck the telemetry consent checkbox
-   - With consent (checked): Collects anonymized prompts, code snippets, and screenshots
-   - Without consent (unchecked): Only collects minimal anonymous usage data (tool names, success/failure, duration)
-
-2. **Environment Variable**: Completely disable all telemetry by running:
-```bash
-DISABLE_TELEMETRY=true uvx blender-mcp
-```
-
-Or add it to your MCP config:
-```json
-{
-    "mcpServers": {
-        "blender": {
-            "command": "uvx",
-            "args": ["blender-mcp"],
-            "env": {
-                "DISABLE_TELEMETRY": "true"
-            }
-        }
-    }
-}
-```
-
-All telemetry data is fully anonymized and used solely to improve BlenderMCP.
 
 
 ## Contributing

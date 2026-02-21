@@ -1,7 +1,7 @@
 [project]
-name = "blender-mcp"
-version = "1.5.5"
-description = "Blender integration through the Model Context Protocol"
+name = "video-draft-mcp"
+version = "0.1.0"
+description = "Video drafting and scaffolding tool through the Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -15,12 +15,17 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.3.0",
-    "supabase>=2.0.0",
-    "tomli>=2.0.0",
+    "pydantic>=2.0",
+    "faster-whisper>=1.0.0",
+    "requests>=2.28.0",
+    "Pillow>=10.0.0",
 ]
 
+[project.optional-dependencies]
+video = ["yt-dlp>=2024.0.0"]
+
 [project.scripts]
-blender-mcp = "blender_mcp.server:main"
+video-draft-mcp = "blender_mcp.server:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -29,6 +34,13 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["src/sdk/tests"]
+
 [project.urls]
-"Homepage" = "https://github.com/yourusername/blender-mcp"
-"Bug Tracker" = "https://github.com/yourusername/blender-mcp/issues"
+"Homepage" = "https://github.com/yourusername/video-draft-mcp"
+"Bug Tracker" = "https://github.com/yourusername/video-draft-mcp/issues"

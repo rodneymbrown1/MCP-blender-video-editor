@@ -14,3 +14,10 @@ wheels/
 
 # Local config secrets
 src/blender_mcp/config.py
+
+# Video Draft MCP runtime
+projects/
+src/sdk/tests/artifacts/
+
+# Whisper models cache
+.cache/

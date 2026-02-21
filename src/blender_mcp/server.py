@@ -1,42 +1,46 @@
-# blender_mcp_server.py
+"""Video Draft MCP Server - MCP tools for video drafting through Claude Desktop."""
+
 from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
 import asyncio
 import logging
 import tempfile
+import uuid
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
+from typing import AsyncIterator, Dict, Any, Optional
 import os
 from pathlib import Path
 import base64
-from urllib.parse import urlparse
 
-# Import telemetry
-from .telemetry import record_startup, get_telemetry
-from .telemetry_decorator import telemetry_tool
+# SDK imports
+from sdk.core.frame import Slide, SlideCollection, SlideStyleProps
+from sdk.core.workspace import Workspace, AssetMetadata
+from sdk.core.state import SessionState, StylePreset, BUILTIN_PRESETS
+from sdk.intake.audio import AudioTranscriber
+from sdk.webscraping.images import ImageSearcher, ImageResult
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("BlenderMCPServer")
+logger = logging.getLogger("VideoDraftMCP")
 
 # Default configuration
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
+DEFAULT_PROJECTS_DIR = "./projects"
+
 
 @dataclass
 class BlenderConnection:
     host: str
     port: int
-    sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
-    
+    sock: socket.socket = None
+
     def connect(self) -> bool:
-        """Connect to the Blender addon socket server"""
         if self.sock:
             return True
-            
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
@@ -46,9 +50,8 @@ class BlenderConnection:
             logger.error(f"Failed to connect to Blender: {str(e)}")
             self.sock = None
             return False
-    
+
     def disconnect(self):
-        """Disconnect from the Blender addon"""
         if self.sock:
             try:
                 self.sock.close()
@@ -58,1129 +61,927 @@ class BlenderConnection:
                 self.sock = None
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
-        
+        sock.settimeout(180.0)
         try:
             while True:
                 try:
                     chunk = sock.recv(buffer_size)
                     if not chunk:
-                        # If we get an empty chunk, the connection might be closed
-                        if not chunks:  # If we haven't received anything yet, this is an error
+                        if not chunks:
                             raise Exception("Connection closed before receiving any data")
                         break
-                    
                     chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
                     try:
                         data = b''.join(chunks)
                         json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
-                        logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
                     except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
                         continue
                 except socket.timeout:
-                    # If we hit a timeout during receiving, break the loop and try to use what we have
-                    logger.warning("Socket timeout during chunked receive")
                     break
                 except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise  # Re-raise to be handled by the caller
+                    raise
         except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        # Try to use what we have
+            pass
+
         if chunks:
             data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
             try:
-                # Try to parse what we have
                 json.loads(data.decode('utf-8'))
                 return data
             except json.JSONDecodeError:
-                # If we can't parse it, it's incomplete
                 raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+        raise Exception("No data received")
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Blender and return the response"""
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Blender")
-        
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
+
+        command = {"type": command_type, "params": params or {}}
         try:
-            # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
             self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
-            
-            # Receive the response using the improved receive_full_response method
+            self.sock.settimeout(180.0)
             response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
             response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
+
             if response.get("status") == "error":
-                logger.error(f"Blender error: {response.get('message')}")
                 raise Exception(response.get("message", "Unknown error from Blender"))
-            
             return response.get("result", {})
         except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
             self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request")
+            raise Exception("Timeout waiting for Blender response")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
             self.sock = None
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
             raise Exception(f"Invalid response from Blender: {str(e)}")
         except Exception as e:
-            logger.error(f"Error communicating with Blender: {str(e)}")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
             self.sock = None
             raise Exception(f"Communication error with Blender: {str(e)}")
 
-@asynccontextmanager
-async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    """Manage server startup and shutdown lifecycle"""
-    # We don't need to create a connection here since we're using the global connection
-    # for resources and tools
 
-    try:
-        # Just log that we're starting up
-        logger.info("BlenderMCP server starting up")
+# ── Global State ────────────────────────────────────────────────────────
 
-        # Record startup event for telemetry
-        try:
-            record_startup()
-        except Exception as e:
-            logger.debug(f"Failed to record startup telemetry: {e}")
+_blender_connection: Optional[BlenderConnection] = None
+_session_state = SessionState()
+_image_searcher = ImageSearcher()
+_audio_transcriber: Optional[AudioTranscriber] = None
 
-        # Try to connect to Blender on startup to verify it's available
-        try:
-            # This will initialize the global connection if needed
-            blender = get_blender_connection()
-            logger.info("Successfully connected to Blender on startup")
-        except Exception as e:
-            logger.warning(f"Could not connect to Blender on startup: {str(e)}")
-            logger.warning("Make sure the Blender addon is running before using Blender resources or tools")
 
-        # Return an empty context - we're using the global connection
-        yield {}
-    finally:
-        # Clean up the global connection on shutdown
-        global _blender_connection
-        if _blender_connection:
-            logger.info("Disconnecting from Blender on shutdown")
-            _blender_connection.disconnect()
-            _blender_connection = None
-        logger.info("BlenderMCP server shut down")
-
-# Create the MCP server with lifespan support
-mcp = FastMCP(
-    "BlenderMCP",
-    lifespan=server_lifespan
-)
-
-# Resource endpoints
-
-# Global connection for resources (since resources can't access context)
-_blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
-
-def get_blender_connection():
-    """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
+def get_blender_connection() -> BlenderConnection:
+    global _blender_connection
     if _blender_connection is not None:
         try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
+            _blender_connection.send_command("get_scene_info")
             return _blender_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
+        except Exception:
             try:
                 _blender_connection.disconnect()
             except:
                 pass
             _blender_connection = None
-    
-    # Create a new connection if needed
-    if _blender_connection is None:
-        host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-        port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-        _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
-    
+
+    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+    _blender_connection = BlenderConnection(host=host, port=port)
+    if not _blender_connection.connect():
+        _blender_connection = None
+        raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
     return _blender_connection
 
 
-@telemetry_tool("get_scene_info")
+def _get_transcriber() -> AudioTranscriber:
+    global _audio_transcriber
+    if _audio_transcriber is None:
+        _audio_transcriber = AudioTranscriber(model_size=_session_state.whisper_model_size)
+    return _audio_transcriber
+
+
+# ── Server Setup ────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
+    try:
+        logger.info("VideoDraftMCP server starting up")
+        try:
+            blender = get_blender_connection()
+            logger.info("Successfully connected to Blender on startup")
+        except Exception as e:
+            logger.warning(f"Could not connect to Blender on startup: {str(e)}")
+            logger.warning("Blender connection is optional - SDK tools will work without it")
+        yield {}
+    finally:
+        global _blender_connection
+        if _blender_connection:
+            _blender_connection.disconnect()
+            _blender_connection = None
+        logger.info("VideoDraftMCP server shut down")
+
+
+mcp = FastMCP("VideoDraftMCP", lifespan=server_lifespan)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PROJECT MANAGEMENT TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def create_project(ctx: Context, project_name: str, base_path: str = "") -> str:
+    """Create a new video draft project with standard directory structure.
+
+    Parameters:
+    - project_name: Name for the project (used as directory name)
+    - base_path: Optional base directory (defaults to ./projects/)
+    """
+    global _session_state
+    base = Path(base_path) if base_path else Path(DEFAULT_PROJECTS_DIR)
+    project_path = base / project_name
+
+    if project_path.exists():
+        return f"Error: Project directory already exists at {project_path}"
+
+    workspace = Workspace(project_name=project_name, root_path=project_path)
+    workspace.initialize()
+
+    _session_state = SessionState(workspace=workspace)
+    _session_state.auto_save()
+
+    return json.dumps({
+        "status": "created",
+        "project_name": project_name,
+        "path": str(project_path),
+        "directories": [
+            "assets/images/", "assets/audio/", "assets/video/",
+            "assets/blender/", "exports/"
+        ],
+    }, indent=2)
+
+
+@mcp.tool()
+def load_project(ctx: Context, project_path: str) -> str:
+    """Load an existing video draft project.
+
+    Parameters:
+    - project_path: Path to the project directory
+    """
+    global _session_state
+    try:
+        workspace = Workspace.load(Path(project_path))
+        _session_state = SessionState(workspace=workspace)
+        _session_state.load_slides_from_workspace()
+
+        return json.dumps({
+            "status": "loaded",
+            "project_name": workspace.project_name,
+            "path": str(workspace.root_path),
+            "asset_count": len(workspace.assets),
+            "slide_count": len(_session_state.slides.slides),
+        }, indent=2)
+    except Exception as e:
+        return f"Error loading project: {str(e)}"
+
+
+@mcp.tool()
+def save_project(ctx: Context) -> str:
+    """Save the current project state (slides and manifest)."""
+    if not _session_state.workspace:
+        return "Error: No project is currently open. Use create_project or load_project first."
+
+    _session_state.auto_save()
+    _session_state.workspace.save_manifest()
+    return f"Project '{_session_state.workspace.project_name}' saved successfully."
+
+
+@mcp.tool()
+def get_project_status(ctx: Context) -> str:
+    """Get the current project status including slide count, assets, etc."""
+    if not _session_state.workspace:
+        return json.dumps({
+            "project_loaded": False,
+            "slide_count": len(_session_state.slides.slides),
+            "message": "No project loaded. Use create_project or load_project.",
+        }, indent=2)
+
+    ws = _session_state.workspace
+    return json.dumps({
+        "project_loaded": True,
+        "project_name": ws.project_name,
+        "path": str(ws.root_path),
+        "slide_count": len(_session_state.slides.slides),
+        "asset_count": len(ws.assets),
+        "assets_by_type": _count_assets_by_type(ws),
+        "undo_depth": len(_session_state.undo_stack),
+    }, indent=2)
+
+
+def _count_assets_by_type(ws: Workspace) -> dict:
+    counts: dict[str, int] = {}
+    for asset in ws.assets.values():
+        counts[asset.type] = counts.get(asset.type, 0) + 1
+    return counts
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AUDIO TRANSCRIPTION TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def transcribe_audio(ctx: Context, file_path: str, model_size: str = "base") -> str:
+    """Transcribe an audio file and generate slides from the transcript.
+
+    Parameters:
+    - file_path: Path to the audio file (wav, mp3, m4a, etc.)
+    - model_size: Whisper model size (tiny, base, small, medium, large-v3)
+    """
+    if not os.path.exists(file_path):
+        return f"Error: File not found: {file_path}"
+
+    try:
+        transcriber = _get_transcriber()
+        transcript = transcriber.transcribe(file_path, model_size=model_size)
+
+        # Cache the raw transcript
+        _session_state.transcript_cache = json.dumps(transcript, indent=2)
+
+        # Generate slides
+        _session_state.checkpoint("Before transcription")
+        slides = transcriber.segments_to_slides(transcript)
+        _session_state.slides = slides
+        _session_state.auto_save()
+
+        # Copy audio to project if workspace exists
+        if _session_state.workspace:
+            import shutil
+            audio_dest = _session_state.workspace.audio_dir / Path(file_path).name
+            if not audio_dest.exists():
+                shutil.copy2(file_path, audio_dest)
+            _session_state.workspace.register_asset(AssetMetadata(
+                asset_id=f"audio_{uuid.uuid4().hex[:8]}",
+                filename=Path(file_path).name,
+                type="audio",
+                source="local",
+            ))
+
+        return json.dumps({
+            "status": "success",
+            "language": transcript.get("language", "unknown"),
+            "duration": f"{transcript.get('duration', 0):.1f}s",
+            "segment_count": len(transcript.get("segments", [])),
+            "slide_count": len(slides.slides),
+            "slides_summary": slides.to_summary(),
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Transcription error: {str(e)}")
+        return f"Error during transcription: {str(e)}"
+
+
+@mcp.tool()
+def get_transcript(ctx: Context) -> str:
+    """Get the raw timestamped transcript from the last transcription."""
+    if not _session_state.transcript_cache:
+        return "No transcript available. Use transcribe_audio first."
+    return _session_state.transcript_cache
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SLIDE CRUD TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_slides(ctx: Context) -> str:
+    """List all slides with their IDs, time ranges, and title snippets."""
+    slides = _session_state.slides
+    if not slides.slides:
+        return "No slides yet. Use transcribe_audio to generate slides from audio."
+    return json.dumps(slides.to_summary(), indent=2)
+
+
+@mcp.tool()
+def get_slide(ctx: Context, slide_id: str) -> str:
+    """Get full details of a specific slide.
+
+    Parameters:
+    - slide_id: The ID of the slide to retrieve
+    """
+    slide = _session_state.slides.get(slide_id)
+    if not slide:
+        return f"Error: Slide '{slide_id}' not found."
+    return json.dumps(slide.model_dump(), indent=2)
+
+
+@mcp.tool()
+def edit_slide(ctx: Context, slide_id: str, title: str = None,
+               body: str = None, speaker_notes: str = None) -> str:
+    """Edit a slide's title, body text, or speaker notes.
+
+    Parameters:
+    - slide_id: The ID of the slide to edit
+    - title: New title (optional)
+    - body: New body text (optional)
+    - speaker_notes: New speaker notes (optional)
+    """
+    slide = _session_state.slides.get(slide_id)
+    if not slide:
+        return f"Error: Slide '{slide_id}' not found."
+
+    _session_state.checkpoint(f"Edit slide {slide_id}")
+
+    if title is not None:
+        slide.title = title
+    if body is not None:
+        slide.body_text = body
+    if speaker_notes is not None:
+        slide.speaker_notes = speaker_notes
+
+    _session_state.auto_save()
+    return json.dumps({
+        "status": "updated",
+        "slide": slide.model_dump(),
+    }, indent=2)
+
+
+@mcp.tool()
+def split_slide(ctx: Context, slide_id: str, at_time: float) -> str:
+    """Split a slide into two at a specific timestamp.
+
+    Parameters:
+    - slide_id: The ID of the slide to split
+    - at_time: The timestamp (in seconds) at which to split
+    """
+    _session_state.checkpoint(f"Split slide {slide_id} at {at_time}s")
+
+    result = _session_state.slides.split(slide_id, at_time)
+    if not result:
+        return f"Error: Could not split slide '{slide_id}' at {at_time}s. Check that the time is within the slide's range."
+
+    s1, s2 = result
+    _session_state.auto_save()
+    return json.dumps({
+        "status": "split",
+        "slide_1": s1.model_dump(),
+        "slide_2": s2.model_dump(),
+    }, indent=2)
+
+
+@mcp.tool()
+def merge_slides(ctx: Context, slide_id_1: str, slide_id_2: str) -> str:
+    """Merge two slides into one (combines text, extends time range).
+
+    Parameters:
+    - slide_id_1: First slide ID
+    - slide_id_2: Second slide ID
+    """
+    _session_state.checkpoint(f"Merge slides {slide_id_1} + {slide_id_2}")
+
+    result = _session_state.slides.merge(slide_id_1, slide_id_2)
+    if not result:
+        return f"Error: Could not merge slides '{slide_id_1}' and '{slide_id_2}'."
+
+    _session_state.auto_save()
+    return json.dumps({
+        "status": "merged",
+        "slide": result.model_dump(),
+    }, indent=2)
+
+
+@mcp.tool()
+def remove_slide(ctx: Context, slide_id: str) -> str:
+    """Remove a slide from the collection.
+
+    Parameters:
+    - slide_id: The ID of the slide to remove
+    """
+    _session_state.checkpoint(f"Remove slide {slide_id}")
+
+    if _session_state.slides.remove(slide_id):
+        _session_state.auto_save()
+        return f"Slide '{slide_id}' removed. {len(_session_state.slides.slides)} slides remaining."
+    return f"Error: Slide '{slide_id}' not found."
+
+
+@mcp.tool()
+def reorder_slides(ctx: Context, slide_id_list: list[str]) -> str:
+    """Reorder slides by providing the complete list of slide IDs in desired order.
+
+    Parameters:
+    - slide_id_list: List of all slide IDs in the new order
+    """
+    _session_state.checkpoint("Reorder slides")
+
+    if _session_state.slides.reorder(slide_id_list):
+        _session_state.auto_save()
+        return json.dumps({
+            "status": "reordered",
+            "slides": _session_state.slides.to_summary(),
+        }, indent=2)
+    return "Error: The provided slide ID list doesn't match the current slides."
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STYLE TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def set_global_style(ctx: Context, preset: str = None,
+                     font_family: str = None, font_size_title: int = None,
+                     font_size_body: int = None, font_color: str = None,
+                     background_color: str = None, text_alignment: str = None,
+                     padding: int = None) -> str:
+    """Set the global style for all slides. Can use a preset or individual properties.
+
+    Parameters:
+    - preset: Named preset (youtube, presentation, cinematic)
+    - font_family: Font family name
+    - font_size_title: Title font size in pixels
+    - font_size_body: Body font size in pixels
+    - font_color: Hex color for text (e.g. "#FFFFFF")
+    - background_color: Hex color for background (e.g. "#1A1A2E")
+    - text_alignment: Text alignment (left, center, right)
+    - padding: Padding in pixels
+    """
+    _session_state.checkpoint("Change global style")
+
+    style = _session_state.slides.global_style
+
+    if preset:
+        p = _session_state.get_preset(preset)
+        if not p:
+            available = ", ".join(BUILTIN_PRESETS.keys())
+            return f"Error: Unknown preset '{preset}'. Available: {available}"
+        _session_state.slides.global_style = p.style.model_copy()
+        style = _session_state.slides.global_style
+
+    # Apply individual overrides on top of preset
+    if font_family is not None:
+        style.font_family = font_family
+    if font_size_title is not None:
+        style.font_size_title = font_size_title
+    if font_size_body is not None:
+        style.font_size_body = font_size_body
+    if font_color is not None:
+        style.font_color = font_color
+    if background_color is not None:
+        style.background_color = background_color
+    if text_alignment is not None:
+        style.text_alignment = text_alignment
+    if padding is not None:
+        style.padding = padding
+
+    _session_state.auto_save()
+    return json.dumps({
+        "status": "updated",
+        "global_style": style.model_dump(),
+        "available_presets": _session_state.list_presets(),
+    }, indent=2)
+
+
+@mcp.tool()
+def set_slide_style(ctx: Context, slide_id: str,
+                    font_family: str = None, font_size_title: int = None,
+                    font_size_body: int = None, font_color: str = None,
+                    background_color: str = None, text_alignment: str = None,
+                    padding: int = None) -> str:
+    """Set style overrides for a specific slide.
+
+    Parameters:
+    - slide_id: The slide to style
+    - (same style properties as set_global_style)
+    """
+    slide = _session_state.slides.get(slide_id)
+    if not slide:
+        return f"Error: Slide '{slide_id}' not found."
+
+    _session_state.checkpoint(f"Style slide {slide_id}")
+
+    if not slide.style_overrides:
+        slide.style_overrides = _session_state.slides.global_style.model_copy()
+
+    s = slide.style_overrides
+    if font_family is not None:
+        s.font_family = font_family
+    if font_size_title is not None:
+        s.font_size_title = font_size_title
+    if font_size_body is not None:
+        s.font_size_body = font_size_body
+    if font_color is not None:
+        s.font_color = font_color
+    if background_color is not None:
+        s.background_color = background_color
+    if text_alignment is not None:
+        s.text_alignment = text_alignment
+    if padding is not None:
+        s.padding = padding
+
+    _session_state.auto_save()
+    return json.dumps({
+        "status": "updated",
+        "slide_id": slide_id,
+        "style_overrides": s.model_dump(),
+    }, indent=2)
+
+
+@mcp.tool()
+def undo(ctx: Context) -> str:
+    """Undo the last slide mutation."""
+    description = _session_state.undo()
+    if description:
+        _session_state.auto_save()
+        return f"Undone: {description}. Slide count: {len(_session_state.slides.slides)}"
+    return "Nothing to undo."
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# IMAGE SEARCH & DOWNLOAD TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def search_images(ctx: Context, query: str, count: int = 5,
+                  orientation: str = "landscape") -> str:
+    """Search for free images across Unsplash, Pexels, and Pixabay.
+
+    Parameters:
+    - query: Search query
+    - count: Number of results (default 5)
+    - orientation: Image orientation (landscape, portrait, squarish)
+    """
+    try:
+        results = _image_searcher.search(query, count=count, orientation=orientation)
+        if not results:
+            status = _image_searcher.get_source_status()
+            configured = [k for k, v in status.items() if v["configured"]]
+            if not configured:
+                return ("No image sources configured. Set API keys via environment variables: "
+                        "UNSPLASH_API_KEY, PEXELS_API_KEY, PIXABAY_API_KEY")
+            return f"No results found for '{query}'"
+
+        return json.dumps([{
+            "id": r.id,
+            "source": r.source,
+            "preview_url": r.preview_url,
+            "download_url": r.download_url,
+            "width": r.width,
+            "height": r.height,
+            "photographer": r.photographer,
+            "license": r.license,
+        } for r in results], indent=2)
+    except Exception as e:
+        return f"Error searching images: {str(e)}"
+
+
+@mcp.tool()
+def download_image(ctx: Context, url: str, slide_id: str = None) -> str:
+    """Download an image and optionally attach it to a slide as background.
+
+    Parameters:
+    - url: URL of the image to download
+    - slide_id: Optional slide ID to attach as background
+    """
+    if not _session_state.workspace:
+        return "Error: No project open. Use create_project first."
+
+    try:
+        dest_path = _image_searcher.download(
+            url, _session_state.workspace.images_dir
+        )
+
+        # Register asset
+        asset_id = f"img_{uuid.uuid4().hex[:8]}"
+        asset = AssetMetadata(
+            asset_id=asset_id,
+            filename=dest_path.name,
+            type="image",
+            source="download",
+        )
+        _session_state.workspace.register_asset(asset)
+
+        # Attach to slide if specified
+        if slide_id:
+            slide = _session_state.slides.get(slide_id)
+            if slide:
+                _session_state.checkpoint(f"Set background for slide {slide_id}")
+                slide.background_image_ref = str(dest_path)
+                _session_state.auto_save()
+
+        return json.dumps({
+            "status": "downloaded",
+            "asset_id": asset_id,
+            "path": str(dest_path),
+            "attached_to_slide": slide_id,
+        }, indent=2)
+    except Exception as e:
+        return f"Error downloading image: {str(e)}"
+
+
+@mcp.tool()
+def set_slide_background(ctx: Context, slide_id: str, asset_id: str) -> str:
+    """Set a downloaded image as a slide's background.
+
+    Parameters:
+    - slide_id: The slide to update
+    - asset_id: The asset ID of the downloaded image
+    """
+    slide = _session_state.slides.get(slide_id)
+    if not slide:
+        return f"Error: Slide '{slide_id}' not found."
+
+    if not _session_state.workspace:
+        return "Error: No project open."
+
+    asset_path = _session_state.workspace.get_asset_path(asset_id)
+    if not asset_path:
+        return f"Error: Asset '{asset_id}' not found."
+
+    _session_state.checkpoint(f"Set background for slide {slide_id}")
+    slide.background_image_ref = str(asset_path)
+    _session_state.auto_save()
+
+    return json.dumps({
+        "status": "updated",
+        "slide_id": slide_id,
+        "background": str(asset_path),
+    }, indent=2)
+
+
+@mcp.tool()
+def scan_titles_for_images(ctx: Context, count_per_slide: int = 3) -> str:
+    """Batch-search images for all slide titles. Returns suggestions per slide.
+
+    Parameters:
+    - count_per_slide: Number of image results per slide (default 3)
+    """
+    slides = _session_state.slides.slides
+    if not slides:
+        return "No slides to scan. Use transcribe_audio first."
+
+    results = {}
+    for slide in slides:
+        query = slide.title if slide.title else slide.body_text[:50]
+        if not query.strip():
+            continue
+        try:
+            images = _image_searcher.search(query, count=count_per_slide)
+            results[slide.id] = {
+                "query": query,
+                "results": [{
+                    "id": r.id,
+                    "source": r.source,
+                    "preview_url": r.preview_url,
+                    "download_url": r.download_url,
+                    "photographer": r.photographer,
+                } for r in images],
+            }
+        except Exception as e:
+            results[slide.id] = {"query": query, "error": str(e)}
+
+    return json.dumps(results, indent=2)
+
+
+@mcp.tool()
+def list_assets(ctx: Context) -> str:
+    """List all assets in the current project workspace."""
+    if not _session_state.workspace:
+        return "Error: No project open. Use create_project first."
+
+    assets = _session_state.workspace.assets
+    if not assets:
+        return "No assets registered yet."
+
+    return json.dumps([{
+        "asset_id": a.asset_id,
+        "filename": a.filename,
+        "type": a.type,
+        "source": a.source,
+    } for a in assets.values()], indent=2)
+
+
+@mcp.tool()
+def get_image_source_status(ctx: Context) -> str:
+    """Check which image API sources are configured and their rate limit status."""
+    return json.dumps(_image_searcher.get_source_status(), indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BLENDER TOOLS (kept from original)
+# ═══════════════════════════════════════════════════════════════════════
+
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
-    """Get detailed information about the current Blender scene"""
+    """Get detailed information about the current Blender scene."""
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_scene_info")
-
-        # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
     except Exception as e:
-        logger.error(f"Error getting scene info from Blender: {str(e)}")
         return f"Error getting scene info: {str(e)}"
 
-@telemetry_tool("get_object_info")
+
 @mcp.tool()
 def get_object_info(ctx: Context, object_name: str) -> str:
-    """
-    Get detailed information about a specific object in the Blender scene.
-    
+    """Get detailed information about a specific object in the Blender scene.
+
     Parameters:
     - object_name: The name of the object to get information about
     """
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_object_info", {"name": object_name})
-        
-        # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
     except Exception as e:
-        logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
 
-@telemetry_tool("get_viewport_screenshot")
+
 @mcp.tool()
 def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
-    """
-    Capture a screenshot of the current Blender 3D viewport.
-    
+    """Capture a screenshot of the current Blender 3D viewport.
+
     Parameters:
     - max_size: Maximum size in pixels for the largest dimension (default: 800)
-    
-    Returns the screenshot as an Image.
     """
     try:
         blender = get_blender_connection()
-        
-        # Create temp file path
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
-        
+
         result = blender.send_command("get_viewport_screenshot", {
             "max_size": max_size,
             "filepath": temp_path,
-            "format": "png"
+            "format": "png",
         })
-        
+
         if "error" in result:
             raise Exception(result["error"])
-        
         if not os.path.exists(temp_path):
             raise Exception("Screenshot file was not created")
-        
-        # Read the file
+
         with open(temp_path, 'rb') as f:
             image_bytes = f.read()
-        
-        # Delete the temp file
         os.remove(temp_path)
-        
+
         return Image(data=image_bytes, format="png")
-        
     except Exception as e:
-        logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
 
 
-@telemetry_tool("execute_blender_code")
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str) -> str:
-    """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
+    """Execute arbitrary Python code in Blender.
 
     Parameters:
     - code: The Python code to execute
     """
     try:
-        # Get the global connection
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
         return f"Code executed successfully: {result.get('result', '')}"
     except Exception as e:
-        logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
 
-@telemetry_tool("get_polyhaven_categories")
-@mcp.tool()
-def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
-    """
-    Get a list of categories for a specific asset type on Polyhaven.
-    
-    Parameters:
-    - asset_type: The type of asset to get categories for (hdris, textures, models, all)
-    """
-    try:
-        blender = get_blender_connection()
-        if not _polyhaven_enabled:
-            return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
-        result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        # Format the categories in a more readable way
-        categories = result["categories"]
-        formatted_output = f"Categories for {asset_type}:\n\n"
-        
-        # Sort categories by count (descending)
-        sorted_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)
-        
-        for category, count in sorted_categories:
-            formatted_output += f"- {category}: {count} assets\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error getting Polyhaven categories: {str(e)}")
-        return f"Error getting Polyhaven categories: {str(e)}"
 
-@telemetry_tool("search_polyhaven_assets")
+# ═══════════════════════════════════════════════════════════════════════
+# VSE RENDERING TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
 @mcp.tool()
-def search_polyhaven_assets(
-    ctx: Context,
-    asset_type: str = "all",
-    categories: str = None
-) -> str:
-    """
-    Search for assets on Polyhaven with optional filtering.
-    
-    Parameters:
-    - asset_type: Type of assets to search for (hdris, textures, models, all)
-    - categories: Optional comma-separated list of categories to filter by
-    
-    Returns a list of matching assets with basic information.
-    """
+def render_slides_to_blender(ctx: Context) -> str:
+    """Push current slides to Blender's Video Sequence Editor for rendering."""
+    slides = _session_state.slides
+    if not slides.slides:
+        return "No slides to render. Use transcribe_audio first."
+
     try:
         blender = get_blender_connection()
-        result = blender.send_command("search_polyhaven_assets", {
-            "asset_type": asset_type,
-            "categories": categories
+        slides_data = slides.model_dump()
+
+        audio_path = None
+        if _session_state.workspace:
+            # Find audio file in workspace
+            for asset in _session_state.workspace.assets.values():
+                if asset.type == "audio":
+                    ap = _session_state.workspace.get_asset_path(asset.asset_id)
+                    if ap and ap.exists():
+                        audio_path = str(ap)
+                        break
+
+        result = blender.send_command("render_slides_to_vse", {
+            "slides_json": json.dumps(slides_data),
+            "audio_path": audio_path,
         })
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        # Format the assets in a more readable way
-        assets = result["assets"]
-        total_count = result["total_count"]
-        returned_count = result["returned_count"]
-        
-        formatted_output = f"Found {total_count} assets"
-        if categories:
-            formatted_output += f" in categories: {categories}"
-        formatted_output += f"\nShowing {returned_count} assets:\n\n"
-        
-        # Sort assets by download count (popularity)
-        sorted_assets = sorted(assets.items(), key=lambda x: x[1].get("download_count", 0), reverse=True)
-        
-        for asset_id, asset_data in sorted_assets:
-            formatted_output += f"- {asset_data.get('name', asset_id)} (ID: {asset_id})\n"
-            formatted_output += f"  Type: {['HDRI', 'Texture', 'Model'][asset_data.get('type', 0)]}\n"
-            formatted_output += f"  Categories: {', '.join(asset_data.get('categories', []))}\n"
-            formatted_output += f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error searching Polyhaven assets: {str(e)}")
-        return f"Error searching Polyhaven assets: {str(e)}"
 
-@telemetry_tool("download_polyhaven_asset")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error rendering to Blender: {str(e)}"
+
+
 @mcp.tool()
-def download_polyhaven_asset(
-    ctx: Context,
-    asset_id: str,
-    asset_type: str,
-    resolution: str = "1k",
-    file_format: str = None
-) -> str:
-    """
-    Download and import a Polyhaven asset into Blender.
-    
+def render_preview_frame(ctx: Context, slide_id: str) -> Image:
+    """Render a preview frame of a specific slide from the VSE.
+
     Parameters:
-    - asset_id: The ID of the asset to download
-    - asset_type: The type of asset (hdris, textures, models)
-    - resolution: The resolution to download (e.g., 1k, 2k, 4k)
-    - file_format: Optional file format (e.g., hdr, exr for HDRIs; jpg, png for textures; gltf, fbx for models)
-    
-    Returns a message indicating success or failure.
+    - slide_id: The slide to preview
     """
+    slide = _session_state.slides.get(slide_id)
+    if not slide:
+        raise Exception(f"Slide '{slide_id}' not found.")
+
     try:
         blender = get_blender_connection()
-        result = blender.send_command("download_polyhaven_asset", {
-            "asset_id": asset_id,
-            "asset_type": asset_type,
-            "resolution": resolution,
-            "file_format": file_format
+
+        # Calculate frame number from slide's start time (assume 30fps)
+        frame_number = int(slide.start_time * 30) + 1
+        temp_path = os.path.join(tempfile.gettempdir(), f"preview_{slide_id}.png")
+
+        result = blender.send_command("render_preview_frame", {
+            "frame_number": frame_number,
+            "filepath": temp_path,
         })
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            message = result.get("message", "Asset downloaded and imported successfully")
-            
-            # Add additional information based on asset type
-            if asset_type == "hdris":
-                return f"{message}. The HDRI has been set as the world environment."
-            elif asset_type == "textures":
-                material_name = result.get("material", "")
-                maps = ", ".join(result.get("maps", []))
-                return f"{message}. Created material '{material_name}' with maps: {maps}."
-            elif asset_type == "models":
-                return f"{message}. The model has been imported into the current scene."
-            else:
-                return message
-        else:
-            return f"Failed to download asset: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error(f"Error downloading Polyhaven asset: {str(e)}")
-        return f"Error downloading Polyhaven asset: {str(e)}"
 
-@telemetry_tool("set_texture")
-@mcp.tool()
-def set_texture(
-    ctx: Context,
-    object_name: str,
-    texture_id: str
-) -> str:
-    """
-    Apply a previously downloaded Polyhaven texture to an object.
-    
-    Parameters:
-    - object_name: Name of the object to apply the texture to
-    - texture_id: ID of the Polyhaven texture to apply (must be downloaded first)
-    
-    Returns a message indicating success or failure.
-    """
-    try:
-        # Get the global connection
-        blender = get_blender_connection()
-        result = blender.send_command("set_texture", {
-            "object_name": object_name,
-            "texture_id": texture_id
-        })
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            material_name = result.get("material", "")
-            maps = ", ".join(result.get("maps", []))
-            
-            # Add detailed material info
-            material_info = result.get("material_info", {})
-            node_count = material_info.get("node_count", 0)
-            has_nodes = material_info.get("has_nodes", False)
-            texture_nodes = material_info.get("texture_nodes", [])
-            
-            output = f"Successfully applied texture '{texture_id}' to {object_name}.\n"
-            output += f"Using material '{material_name}' with maps: {maps}.\n\n"
-            output += f"Material has nodes: {has_nodes}\n"
-            output += f"Total node count: {node_count}\n\n"
-            
-            if texture_nodes:
-                output += "Texture nodes:\n"
-                for node in texture_nodes:
-                    output += f"- {node['name']} using image: {node['image']}\n"
-                    if node['connections']:
-                        output += "  Connections:\n"
-                        for conn in node['connections']:
-                            output += f"    {conn}\n"
-            else:
-                output += "No texture nodes found in the material.\n"
-            
-            return output
-        else:
-            return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error(f"Error applying texture: {str(e)}")
-        return f"Error applying texture: {str(e)}"
-
-@telemetry_tool("get_polyhaven_status")
-@mcp.tool()
-def get_polyhaven_status(ctx: Context) -> str:
-    """
-    Check if PolyHaven integration is enabled in Blender.
-    Returns a message indicating whether PolyHaven features are available.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_polyhaven_status")
-        enabled = result.get("enabled", False)
-        message = result.get("message", "")
-        if enabled:
-            message += "PolyHaven is good at Textures, and has a wider variety of textures than Sketchfab."
-        return message
-    except Exception as e:
-        logger.error(f"Error checking PolyHaven status: {str(e)}")
-        return f"Error checking PolyHaven status: {str(e)}"
-
-@telemetry_tool("get_hyper3d_status")
-@mcp.tool()
-def get_hyper3d_status(ctx: Context) -> str:
-    """
-    Check if Hyper3D Rodin integration is enabled in Blender.
-    Returns a message indicating whether Hyper3D Rodin features are available.
-
-    Don't emphasize the key type in the returned message, but sliently remember it. 
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_hyper3d_status")
-        enabled = result.get("enabled", False)
-        message = result.get("message", "")
-        if enabled:
-            message += ""
-        return message
-    except Exception as e:
-        logger.error(f"Error checking Hyper3D status: {str(e)}")
-        return f"Error checking Hyper3D status: {str(e)}"
-
-@telemetry_tool("get_sketchfab_status")
-@mcp.tool()
-def get_sketchfab_status(ctx: Context) -> str:
-    """
-    Check if Sketchfab integration is enabled in Blender.
-    Returns a message indicating whether Sketchfab features are available.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_sketchfab_status")
-        enabled = result.get("enabled", False)
-        message = result.get("message", "")
-        if enabled:
-            message += "Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven."        
-        return message
-    except Exception as e:
-        logger.error(f"Error checking Sketchfab status: {str(e)}")
-        return f"Error checking Sketchfab status: {str(e)}"
-
-@telemetry_tool("search_sketchfab_models")
-@mcp.tool()
-def search_sketchfab_models(
-    ctx: Context,
-    query: str,
-    categories: str = None,
-    count: int = 20,
-    downloadable: bool = True
-) -> str:
-    """
-    Search for models on Sketchfab with optional filtering.
-
-    Parameters:
-    - query: Text to search for
-    - categories: Optional comma-separated list of categories
-    - count: Maximum number of results to return (default 20)
-    - downloadable: Whether to include only downloadable models (default True)
-
-    Returns a formatted list of matching models.
-    """
-    try:
-        blender = get_blender_connection()
-        logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
-        result = blender.send_command("search_sketchfab_models", {
-            "query": query,
-            "categories": categories,
-            "count": count,
-            "downloadable": downloadable
-        })
-        
-        if "error" in result:
-            logger.error(f"Error from Sketchfab search: {result['error']}")
-            return f"Error: {result['error']}"
-        
-        # Safely get results with fallbacks for None
-        if result is None:
-            logger.error("Received None result from Sketchfab search")
-            return "Error: Received no response from Sketchfab search"
-            
-        # Format the results
-        models = result.get("results", []) or []
-        if not models:
-            return f"No models found matching '{query}'"
-            
-        formatted_output = f"Found {len(models)} models matching '{query}':\n\n"
-        
-        for model in models:
-            if model is None:
-                continue
-                
-            model_name = model.get("name", "Unnamed model")
-            model_uid = model.get("uid", "Unknown ID")
-            formatted_output += f"- {model_name} (UID: {model_uid})\n"
-            
-            # Get user info with safety checks
-            user = model.get("user") or {}
-            username = user.get("username", "Unknown author") if isinstance(user, dict) else "Unknown author"
-            formatted_output += f"  Author: {username}\n"
-            
-            # Get license info with safety checks
-            license_data = model.get("license") or {}
-            license_label = license_data.get("label", "Unknown") if isinstance(license_data, dict) else "Unknown"
-            formatted_output += f"  License: {license_label}\n"
-            
-            # Add face count and downloadable status
-            face_count = model.get("faceCount", "Unknown")
-            is_downloadable = "Yes" if model.get("isDownloadable") else "No"
-            formatted_output += f"  Face count: {face_count}\n"
-            formatted_output += f"  Downloadable: {is_downloadable}\n\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error searching Sketchfab models: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return f"Error searching Sketchfab models: {str(e)}"
-
-@telemetry_tool("download_sketchfab_model")
-@mcp.tool()
-def get_sketchfab_model_preview(
-    ctx: Context,
-    uid: str
-) -> Image:
-    """
-    Get a preview thumbnail of a Sketchfab model by its UID.
-    Use this to visually confirm a model before downloading.
-    
-    Parameters:
-    - uid: The unique identifier of the Sketchfab model (obtained from search_sketchfab_models)
-    
-    Returns the model's thumbnail as an Image for visual confirmation.
-    """
-    try:
-        blender = get_blender_connection()
-        logger.info(f"Getting Sketchfab model preview for UID: {uid}")
-        
-        result = blender.send_command("get_sketchfab_model_preview", {"uid": uid})
-        
-        if result is None:
-            raise Exception("Received no response from Blender")
-        
         if "error" in result:
             raise Exception(result["error"])
-        
-        # Decode base64 image data
-        image_data = base64.b64decode(result["image_data"])
-        img_format = result.get("format", "jpeg")
-        
-        # Log model info
-        model_name = result.get("model_name", "Unknown")
-        author = result.get("author", "Unknown")
-        logger.info(f"Preview retrieved for '{model_name}' by {author}")
-        
-        return Image(data=image_data, format=img_format)
-        
+
+        with open(temp_path, 'rb') as f:
+            image_bytes = f.read()
+        os.remove(temp_path)
+
+        return Image(data=image_bytes, format="png")
     except Exception as e:
-        logger.error(f"Error getting Sketchfab preview: {str(e)}")
-        raise Exception(f"Failed to get preview: {str(e)}")
+        raise Exception(f"Preview render failed: {str(e)}")
 
 
 @mcp.tool()
-def download_sketchfab_model(
-    ctx: Context,
-    uid: str,
-    target_size: float
-) -> str:
-    """
-    Download and import a Sketchfab model by its UID.
-    The model will be scaled so its largest dimension equals target_size.
-    
+def export_video(ctx: Context, output_path: str = None, format: str = "MPEG4") -> str:
+    """Export the VSE timeline as a video file.
+
     Parameters:
-    - uid: The unique identifier of the Sketchfab model
-    - target_size: REQUIRED. The target size in Blender units/meters for the largest dimension.
-                  You must specify the desired size for the model.
-                  Examples:
-                  - Chair: target_size=1.0 (1 meter tall)
-                  - Table: target_size=0.75 (75cm tall)
-                  - Car: target_size=4.5 (4.5 meters long)
-                  - Person: target_size=1.7 (1.7 meters tall)
-                  - Small object (cup, phone): target_size=0.1 to 0.3
-    
-    Returns a message with import details including object names, dimensions, and bounding box.
-    The model must be downloadable and you must have proper access rights.
+    - output_path: Output file path (defaults to project exports dir)
+    - format: Video format (MPEG4, AVI, etc.)
     """
-    try:
-        blender = get_blender_connection()
-        logger.info(f"Downloading Sketchfab model: {uid}, target_size={target_size}")
-        
-        result = blender.send_command("download_sketchfab_model", {
-            "uid": uid,
-            "normalize_size": True,  # Always normalize
-            "target_size": target_size
-        })
-        
-        if result is None:
-            logger.error("Received None result from Sketchfab download")
-            return "Error: Received no response from Sketchfab download request"
-            
-        if "error" in result:
-            logger.error(f"Error from Sketchfab download: {result['error']}")
-            return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            imported_objects = result.get("imported_objects", [])
-            object_names = ", ".join(imported_objects) if imported_objects else "none"
-            
-            output = f"Successfully imported model.\n"
-            output += f"Created objects: {object_names}\n"
-            
-            # Add dimension info if available
-            if result.get("dimensions"):
-                dims = result["dimensions"]
-                output += f"Dimensions (X, Y, Z): {dims[0]:.3f} x {dims[1]:.3f} x {dims[2]:.3f} meters\n"
-            
-            # Add bounding box info if available
-            if result.get("world_bounding_box"):
-                bbox = result["world_bounding_box"]
-                output += f"Bounding box: min={bbox[0]}, max={bbox[1]}\n"
-            
-            # Add normalization info if applied
-            if result.get("normalized"):
-                scale = result.get("scale_applied", 1.0)
-                output += f"Size normalized: scale factor {scale:.6f} applied (target size: {target_size}m)\n"
-            
-            return output
+    if not output_path:
+        if _session_state.workspace:
+            output_path = str(
+                _session_state.workspace.exports_dir /
+                f"{_session_state.workspace.project_name}.mp4"
+            )
         else:
-            return f"Failed to download model: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error(f"Error downloading Sketchfab model: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return f"Error downloading Sketchfab model: {str(e)}"
+            output_path = os.path.join(tempfile.gettempdir(), "video_draft_export.mp4")
 
-def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | None:
-    if original_bbox is None:
-        return None
-    if all(isinstance(i, int) for i in original_bbox):
-        return original_bbox
-    if any(i<=0 for i in original_bbox):
-        raise ValueError("Incorrect number range: bbox must be bigger than zero!")
-    return [int(float(i) / max(original_bbox) * 100) for i in original_bbox] if original_bbox else None
-
-@telemetry_tool("generate_hyper3d_model_via_text")
-@mcp.tool()
-def generate_hyper3d_model_via_text(
-    ctx: Context,
-    text_prompt: str,
-    bbox_condition: list[float]=None
-) -> str:
-    """
-    Generate 3D asset using Hyper3D by giving description of the desired asset, and import the asset into Blender.
-    The 3D asset has built-in materials.
-    The generated model has a normalized size, so re-scaling after generation can be useful.
-
-    Parameters:
-    - text_prompt: A short description of the desired model in **English**.
-    - bbox_condition: Optional. If given, it has to be a list of floats of length 3. Controls the ratio between [Length, Width, Height] of the model.
-
-    Returns a message indicating success or failure.
-    """
     try:
         blender = get_blender_connection()
-        result = blender.send_command("create_rodin_job", {
-            "text_prompt": text_prompt,
-            "images": None,
-            "bbox_condition": _process_bbox(bbox_condition),
+        result = blender.send_command("export_video", {
+            "output_path": output_path,
+            "format": format,
         })
-        succeed = result.get("submit_time", False)
-        if succeed:
-            return json.dumps({
-                "task_uuid": result["uuid"],
-                "subscription_key": result["jobs"]["subscription_key"],
-            })
-        else:
-            return json.dumps(result)
+        return json.dumps(result, indent=2)
     except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
+        return f"Error exporting video: {str(e)}"
 
-@telemetry_tool("generate_hyper3d_model_via_images")
-@mcp.tool()
-def generate_hyper3d_model_via_images(
-    ctx: Context,
-    input_image_paths: list[str]=None,
-    input_image_urls: list[str]=None,
-    bbox_condition: list[float]=None
-) -> str:
-    """
-    Generate 3D asset using Hyper3D by giving images of the wanted asset, and import the generated asset into Blender.
-    The 3D asset has built-in materials.
-    The generated model has a normalized size, so re-scaling after generation can be useful.
-    
-    Parameters:
-    - input_image_paths: The **absolute** paths of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in MAIN_SITE mode.
-    - input_image_urls: The URLs of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in FAL_AI mode.
-    - bbox_condition: Optional. If given, it has to be a list of ints of length 3. Controls the ratio between [Length, Width, Height] of the model.
 
-    Only one of {input_image_paths, input_image_urls} should be given at a time, depending on the Hyper3D Rodin's current mode.
-    Returns a message indicating success or failure.
-    """
-    if input_image_paths is not None and input_image_urls is not None:
-        return f"Error: Conflict parameters given!"
-    if input_image_paths is None and input_image_urls is None:
-        return f"Error: No image given!"
-    if input_image_paths is not None:
-        if not all(os.path.exists(i) for i in input_image_paths):
-            return "Error: not all image paths are valid!"
-        images = []
-        for path in input_image_paths:
-            with open(path, "rb") as f:
-                images.append(
-                    (Path(path).suffix, base64.b64encode(f.read()).decode("ascii"))
-                )
-    elif input_image_urls is not None:
-        if not all(urlparse(i) for i in input_image_paths):
-            return "Error: not all image URLs are valid!"
-        images = input_image_urls.copy()
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("create_rodin_job", {
-            "text_prompt": None,
-            "images": images,
-            "bbox_condition": _process_bbox(bbox_condition),
-        })
-        succeed = result.get("submit_time", False)
-        if succeed:
-            return json.dumps({
-                "task_uuid": result["uuid"],
-                "subscription_key": result["jobs"]["subscription_key"],
-            })
-        else:
-            return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
-
-@telemetry_tool("poll_rodin_job_status")
-@mcp.tool()
-def poll_rodin_job_status(
-    ctx: Context,
-    subscription_key: str=None,
-    request_id: str=None,
-):
-    """
-    Check if the Hyper3D Rodin generation task is completed.
-
-    For Hyper3D Rodin mode MAIN_SITE:
-        Parameters:
-        - subscription_key: The subscription_key given in the generate model step.
-
-        Returns a list of status. The task is done if all status are "Done".
-        If "Failed" showed up, the generating process failed.
-        This is a polling API, so only proceed if the status are finally determined ("Done" or "Canceled").
-
-    For Hyper3D Rodin mode FAL_AI:
-        Parameters:
-        - request_id: The request_id given in the generate model step.
-
-        Returns the generation task status. The task is done if status is "COMPLETED".
-        The task is in progress if status is "IN_PROGRESS".
-        If status other than "COMPLETED", "IN_PROGRESS", "IN_QUEUE" showed up, the generating process might be failed.
-        This is a polling API, so only proceed if the status are finally determined ("COMPLETED" or some failed state).
-    """
-    try:
-        blender = get_blender_connection()
-        kwargs = {}
-        if subscription_key:
-            kwargs = {
-                "subscription_key": subscription_key,
-            }
-        elif request_id:
-            kwargs = {
-                "request_id": request_id,
-            }
-        result = blender.send_command("poll_rodin_job_status", kwargs)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
-
-@telemetry_tool("import_generated_asset")
-@mcp.tool()
-def import_generated_asset(
-    ctx: Context,
-    name: str,
-    task_uuid: str=None,
-    request_id: str=None,
-):
-    """
-    Import the asset generated by Hyper3D Rodin after the generation task is completed.
-
-    Parameters:
-    - name: The name of the object in scene
-    - task_uuid: For Hyper3D Rodin mode MAIN_SITE: The task_uuid given in the generate model step.
-    - request_id: For Hyper3D Rodin mode FAL_AI: The request_id given in the generate model step.
-
-    Only give one of {task_uuid, request_id} based on the Hyper3D Rodin Mode!
-    Return if the asset has been imported successfully.
-    """
-    try:
-        blender = get_blender_connection()
-        kwargs = {
-            "name": name
-        }
-        if task_uuid:
-            kwargs["task_uuid"] = task_uuid
-        elif request_id:
-            kwargs["request_id"] = request_id
-        result = blender.send_command("import_generated_asset", kwargs)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
-
-@mcp.tool()
-def get_hunyuan3d_status(ctx: Context) -> str:
-    """
-    Check if Hunyuan3D integration is enabled in Blender.
-    Returns a message indicating whether Hunyuan3D features are available.
-
-    Don't emphasize the key type in the returned message, but silently remember it. 
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_hunyuan3d_status")
-        message = result.get("message", "")
-        return message
-    except Exception as e:
-        logger.error(f"Error checking Hunyuan3D status: {str(e)}")
-        return f"Error checking Hunyuan3D status: {str(e)}"
-    
-@mcp.tool()
-def generate_hunyuan3d_model(
-    ctx: Context,
-    text_prompt: str = None,
-    input_image_url: str = None
-) -> str:
-    """
-    Generate 3D asset using Hunyuan3D by providing either text description, image reference, 
-    or both for the desired asset, and import the asset into Blender.
-    The 3D asset has built-in materials.
-    
-    Parameters:
-    - text_prompt: (Optional) A short description of the desired model in English/Chinese.
-    - input_image_url: (Optional) The local or remote url of the input image. Accepts None if only using text prompt.
-
-    Returns: 
-    - When successful, returns a JSON with job_id (format: "job_xxx") indicating the task is in progress
-    - When the job completes, the status will change to "DONE" indicating the model has been imported
-    - Returns error message if the operation fails
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("create_hunyuan_job", {
-            "text_prompt": text_prompt,
-            "image": input_image_url,
-        })
-        if "JobId" in result.get("Response", {}):
-            job_id = result["Response"]["JobId"]
-            formatted_job_id = f"job_{job_id}"
-            return json.dumps({
-                "job_id": formatted_job_id,
-            })
-        return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error generating Hunyuan3D task: {str(e)}")
-        return f"Error generating Hunyuan3D task: {str(e)}"
-    
-@mcp.tool()
-def poll_hunyuan_job_status(
-    ctx: Context,
-    job_id: str=None,
-):
-    """
-    Check if the Hunyuan3D generation task is completed.
-
-    For Hunyuan3D:
-        Parameters:
-        - job_id: The job_id given in the generate model step.
-
-        Returns the generation task status. The task is done if status is "DONE".
-        The task is in progress if status is "RUN".
-        If status is "DONE", returns ResultFile3Ds, which is the generated ZIP model path
-        When the status is "DONE", the response includes a field named ResultFile3Ds that contains the generated ZIP file path of the 3D model in OBJ format.
-        This is a polling API, so only proceed if the status are finally determined ("DONE" or some failed state).
-    """
-    try:
-        blender = get_blender_connection()
-        kwargs = {
-            "job_id": job_id,
-        }
-        result = blender.send_command("poll_hunyuan_job_status", kwargs)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating Hunyuan3D task: {str(e)}")
-        return f"Error generating Hunyuan3D task: {str(e)}"
-
-@mcp.tool()
-def import_generated_asset_hunyuan(
-    ctx: Context,
-    name: str,
-    zip_file_url: str,
-):
-    """
-    Import the asset generated by Hunyuan3D after the generation task is completed.
-
-    Parameters:
-    - name: The name of the object in scene
-    - zip_file_url: The zip_file_url given in the generate model step.
-
-    Return if the asset has been imported successfully.
-    """
-    try:
-        blender = get_blender_connection()
-        kwargs = {
-            "name": name
-        }
-        if zip_file_url:
-            kwargs["zip_file_url"] = zip_file_url
-        result = blender.send_command("import_generated_asset_hunyuan", kwargs)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating Hunyuan3D task: {str(e)}")
-        return f"Error generating Hunyuan3D task: {str(e)}"
-
+# ═══════════════════════════════════════════════════════════════════════
+# MCP PROMPT
+# ═══════════════════════════════════════════════════════════════════════
 
 @mcp.prompt()
-def asset_creation_strategy() -> str:
-    """Defines the preferred strategy for creating assets in Blender"""
-    return """When creating 3D content in Blender, always start by checking if integrations are available:
+def video_draft_workflow() -> str:
+    """Recommended workflow for creating a video draft"""
+    return """You are helping the user create a video draft. Follow this workflow:
 
-    0. Before anything, always check the scene from get_scene_info()
-    1. First use the following tools to verify if the following integrations are enabled:
-        1. PolyHaven
-            Use get_polyhaven_status() to verify its status
-            If PolyHaven is enabled:
-            - For objects/models: Use download_polyhaven_asset() with asset_type="models"
-            - For materials/textures: Use download_polyhaven_asset() with asset_type="textures"
-            - For environment lighting: Use download_polyhaven_asset() with asset_type="hdris"
-        2. Sketchfab
-            Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven.
-            Use get_sketchfab_status() to verify its status
-            If Sketchfab is enabled:
-            - For objects/models: First search using search_sketchfab_models() with your query
-            - Then download specific models using download_sketchfab_model() with the UID
-            - Note that only downloadable models can be accessed, and API key must be properly configured
-            - Sketchfab has a wider variety of models than PolyHaven, especially for specific subjects
-        3. Hyper3D(Rodin)
-            Hyper3D Rodin is good at generating 3D models for single item.
-            So don't try to:
-            1. Generate the whole scene with one shot
-            2. Generate ground using Hyper3D
-            3. Generate parts of the items separately and put them together afterwards
+1. **Create Project**: Use create_project() to set up a new project workspace.
 
-            Use get_hyper3d_status() to verify its status
-            If Hyper3D is enabled:
-            - For objects/models, do the following steps:
-                1. Create the model generation task
-                    - Use generate_hyper3d_model_via_images() if image(s) is/are given
-                    - Use generate_hyper3d_model_via_text() if generating 3D asset using text prompt
-                    If key type is free_trial and insufficient balance error returned, tell the user that the free trial key can only generated limited models everyday, they can choose to:
-                    - Wait for another day and try again
-                    - Go to hyper3d.ai to find out how to get their own API key
-                    - Go to fal.ai to get their own private API key
-                2. Poll the status
-                    - Use poll_rodin_job_status() to check if the generation task has completed or failed
-                3. Import the asset
-                    - Use import_generated_asset() to import the generated GLB model the asset
-                4. After importing the asset, ALWAYS check the world_bounding_box of the imported mesh, and adjust the mesh's location and size
-                    Adjust the imported mesh's location, scale, rotation, so that the mesh is on the right spot.
+2. **Transcribe Audio**: Use transcribe_audio() with the user's audio file.
+   This will auto-generate slides from the speech with timestamps.
 
-                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
-        4. Hunyuan3D
-            Hunyuan3D is good at generating 3D models for single item.
-            So don't try to:
-            1. Generate the whole scene with one shot
-            2. Generate ground using Hunyuan3D
-            3. Generate parts of the items separately and put them together afterwards
+3. **Review & Edit Slides**: Use get_slides() to see all slides, then:
+   - Use edit_slide() to add titles and refine body text
+   - Use split_slide() or merge_slides() to adjust slide boundaries
+   - Use remove_slide() for unwanted content
 
-            Use get_hunyuan3d_status() to verify its status
-            If Hunyuan3D is enabled:
-                if Hunyuan3D mode is "OFFICIAL_API":
-                    - For objects/models, do the following steps:
-                        1. Create the model generation task
-                            - Use generate_hunyuan3d_model by providing either a **text description** OR an **image(local or urls) reference**.
-                            - Go to cloud.tencent.com out how to get their own SecretId and SecretKey
-                        2. Poll the status
-                            - Use poll_hunyuan_job_status() to check if the generation task has completed or failed
-                        3. Import the asset
-                            - Use import_generated_asset_hunyuan() to import the generated OBJ model the asset
-                    if Hunyuan3D mode is "LOCAL_API":
-                        - For objects/models, do the following steps:
-                        1. Create the model generation task
-                            - Use generate_hunyuan3d_model if image (local or urls)  or text prompt is given and import the asset
+4. **Search & Add Images**: Use search_images() to find background images.
+   - Use scan_titles_for_images() for batch suggestions
+   - Use download_image() to save images and attach to slides
+   - Use set_slide_background() to assign images
 
-                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
+5. **Style**: Use set_global_style() with a preset (youtube, presentation, cinematic)
+   or custom properties. Use set_slide_style() for per-slide overrides.
 
-    3. Always check the world_bounding_box for each item so that:
-        - Ensure that all objects that should not be clipping are not clipping.
-        - Items have right spatial relationship.
-    
-    4. Recommended asset source priority:
-        - For specific existing objects: First try Sketchfab, then PolyHaven
-        - For generic objects/furniture: First try PolyHaven, then Sketchfab
-        - For custom or unique items not available in libraries: Use Hyper3D Rodin or Hunyuan3D
-        - For environment lighting: Use PolyHaven HDRIs
-        - For materials/textures: Use PolyHaven textures
+6. **Render**: Use render_slides_to_blender() to push to Blender's VSE.
+   - Use render_preview_frame() to preview individual slides
+   - Use export_video() to render the final video
 
-    Only fall back to scripting when:
-    - PolyHaven, Sketchfab, Hyper3D, and Hunyuan3D are all disabled
-    - A simple primitive is explicitly requested
-    - No suitable asset exists in any of the libraries
-    - Hyper3D Rodin or Hunyuan3D failed to generate the desired asset
-    - The task specifically requires a basic material/color
-    """
+Tips:
+- Whisper generates body text only - use edit_slide() to add descriptive titles
+- Use undo() if you make a mistake
+- Use save_project() periodically to persist state
+- Use get_project_status() to check overall progress
+- Check get_image_source_status() to see which image APIs are configured
+"""
 
-# Main execution
+
+# ── Main ────────────────────────────────────────────────────────────────
 
 def main():
     """Run the MCP server"""
     mcp.run()
+
 
 if __name__ == "__main__":
     main()
