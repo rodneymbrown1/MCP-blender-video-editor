@@ -937,13 +937,55 @@ def export_video(ctx: Context, output_path: str = None, format: str = "MPEG4") -
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# MCP RESOURCES (knowledge files served to the LLM on request)
+# ═══════════════════════════════════════════════════════════════════════
+
+_DOCS_DIR = Path(__file__).resolve().parent.parent.parent / "docs"
+
+
+@mcp.resource("docs://whoami")
+def get_whoami() -> str:
+    """Video Draft MCP identity — what this tool is, its capabilities, and limitations"""
+    return (_DOCS_DIR / "whoami.md").read_text()
+
+
+@mcp.resource("docs://style-guide")
+def get_style_guide() -> str:
+    """Style presets, properties, hierarchy, and supported fonts/colors"""
+    return (_DOCS_DIR / "style-guide.md").read_text()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MCP PROMPT
 # ═══════════════════════════════════════════════════════════════════════
 
 @mcp.prompt()
 def video_draft_workflow() -> str:
     """Recommended workflow for creating a video draft"""
-    return """You are helping the user create a video draft. Follow this workflow:
+    # Load whoami and style guide so the LLM has full context
+    whoami = ""
+    style_guide = ""
+    try:
+        whoami = (_DOCS_DIR / "whoami.md").read_text()
+        style_guide = (_DOCS_DIR / "style-guide.md").read_text()
+    except FileNotFoundError:
+        pass
+
+    return f"""## About This Tool
+
+{whoami}
+
+---
+
+## Style Reference
+
+{style_guide}
+
+---
+
+## Workflow
+
+You are helping the user create a video draft. Follow this workflow:
 
 1. **Create Project**: Use create_project() to set up a new project workspace.
 
