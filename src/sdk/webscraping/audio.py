@@ -1,17 +1,30 @@
-"""Music and SFX sourcing (stub for future freesound.org integration)."""
+"""Audio sourcing via Openverse API."""
+
+import logging
+from pathlib import Path
+from typing import Optional
+
+from .openverse import AudioResult, OpenverseClient
+
+logger = logging.getLogger("VideoDraftMCP.webscraping.audio")
 
 
-def search_music(query: str, duration_max: float = 60.0) -> list[dict]:
-    """Search for royalty-free music tracks.
+class AudioSearcher:
+    """Audio search and download powered by Openverse."""
 
-    This is a stub for future freesound.org API integration.
-    """
-    raise NotImplementedError("Music sourcing is not yet implemented")
+    def __init__(self, openverse_client: Optional[OpenverseClient] = None):
+        self._client = openverse_client or OpenverseClient()
 
+    def search(self, query: str, count: int = 5,
+               duration_max: Optional[float] = None) -> list[AudioResult]:
+        """Search for audio tracks."""
+        return self._client.search_audio(query, count=count, duration_max=duration_max)
 
-def search_sfx(query: str) -> list[dict]:
-    """Search for sound effects.
+    def download(self, url: str, dest_dir: Path,
+                 filename: Optional[str] = None) -> Path:
+        """Download an audio file."""
+        return self._client.download(url, dest_dir, filename=filename)
 
-    This is a stub for future freesound.org API integration.
-    """
-    raise NotImplementedError("SFX sourcing is not yet implemented")
+    def get_source_status(self) -> dict:
+        """Report Openverse audio source status."""
+        return self._client.get_status()

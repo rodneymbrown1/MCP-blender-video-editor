@@ -62,13 +62,14 @@ class ImageSearcher:
 
     CACHE_TTL = 900  # 15 minutes
 
-    def __init__(self):
+    def __init__(self, openverse_client=None):
         self._rate_limiters: dict[str, RateLimiter] = {
             "unsplash": RateLimiter(50, 3600),   # 50/hour
             "pexels": RateLimiter(200, 3600),     # 200/hour
             "pixabay": RateLimiter(100, 60),      # 100/minute
         }
         self._cache: dict[str, _CacheEntry] = {}
+        self._openverse_client = openverse_client
 
     @staticmethod
     def _get_api_key(source: str) -> Optional[str]:
@@ -89,6 +90,8 @@ class ImageSearcher:
                 "configured": bool(key),
                 "remaining_requests": limiter.tokens,
             }
+        if self._openverse_client:
+            status["openverse"] = self._openverse_client.get_status()
         return status
 
     def search(self, query: str, count: int = 5,
@@ -123,6 +126,17 @@ class ImageSearcher:
                     results.extend(self._search_pixabay(query, per_source, min_width, orientation, key))
             except Exception as e:
                 logger.error(f"Error searching {source}: {e}")
+
+        # Supplement with Openverse if we still need more results
+        if len(results) < count and self._openverse_client:
+            try:
+                remaining = count - len(results)
+                ov_results = self._openverse_client.search_images(
+                    query, count=remaining, orientation=orientation,
+                )
+                results.extend(ov_results)
+            except Exception as e:
+                logger.error(f"Error searching Openverse: {e}")
 
         self._cache[cache_key] = _CacheEntry(results=results, timestamp=time.time())
         return results[:count]

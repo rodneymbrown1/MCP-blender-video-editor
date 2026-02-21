@@ -6,7 +6,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from sdk.webscraping.images import RateLimiter, ImageResult, ImageSearcher
+from sdk.webscraping.images import RateLimiter, ImageResult, ImageSearcher, _CacheEntry
 
 
 # ── RateLimiter ─────────────────────────────────────────────────────────
@@ -309,3 +309,92 @@ class TestImageSearcherDownload:
             tmp_path,
         )
         assert result.suffix == ".webp"
+
+
+# ── ImageSearcher Openverse fallback ───────────────────────────────────
+
+class TestImageSearcherOpenverseFallback:
+    def test_uses_openverse_when_no_api_keys(self):
+        mock_ov = MagicMock()
+        mock_ov.search_images.return_value = [
+            ImageResult(
+                id="ov1", source="openverse",
+                preview_url="p", full_url="f", download_url="d",
+                width=800, height=600,
+            ),
+        ]
+
+        with patch.dict(os.environ, {}, clear=True):
+            searcher = ImageSearcher(openverse_client=mock_ov)
+            results = searcher.search("sunset", count=1)
+            assert len(results) == 1
+            assert results[0].source == "openverse"
+            mock_ov.search_images.assert_called_once()
+
+    @patch("sdk.webscraping.images.requests.get")
+    def test_openverse_supplements_partial_results(self, mock_get):
+        # Unsplash returns 1 result, need 3 total → Openverse fills remaining
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [{
+                "id": "u1",
+                "urls": {"small": "s", "regular": "r", "full": "f"},
+                "width": 1920, "height": 1080,
+                "user": {"name": "P"},
+            }]
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        mock_ov = MagicMock()
+        mock_ov.search_images.return_value = [
+            ImageResult(
+                id="ov1", source="openverse",
+                preview_url="p", full_url="f", download_url="d",
+                width=800, height=600,
+            ),
+            ImageResult(
+                id="ov2", source="openverse",
+                preview_url="p", full_url="f", download_url="d",
+                width=800, height=600,
+            ),
+        ]
+
+        with patch.dict(os.environ, {"UNSPLASH_API_KEY": "key"}, clear=True):
+            searcher = ImageSearcher(openverse_client=mock_ov)
+            results = searcher.search("nature", count=3)
+            assert len(results) == 3
+            assert results[0].source == "unsplash"
+            assert results[1].source == "openverse"
+            mock_ov.search_images.assert_called_once_with(
+                "nature", count=2, orientation="landscape",
+            )
+
+    def test_openverse_error_handled_gracefully(self):
+        mock_ov = MagicMock()
+        mock_ov.search_images.side_effect = Exception("Openverse down")
+
+        with patch.dict(os.environ, {}, clear=True):
+            searcher = ImageSearcher(openverse_client=mock_ov)
+            results = searcher.search("test", count=5)
+            assert results == []
+
+    def test_openverse_status_included(self):
+        mock_ov = MagicMock()
+        mock_ov.get_status.return_value = {
+            "source": "openverse",
+            "authenticated": False,
+            "remaining_requests": 18,
+        }
+
+        with patch.dict(os.environ, {}, clear=True):
+            searcher = ImageSearcher(openverse_client=mock_ov)
+            status = searcher.get_source_status()
+            assert "openverse" in status
+            assert status["openverse"]["source"] == "openverse"
+
+    def test_no_openverse_client_no_fallback(self):
+        with patch.dict(os.environ, {}, clear=True):
+            searcher = ImageSearcher()
+            results = searcher.search("sunset")
+            assert results == []

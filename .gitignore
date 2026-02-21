@@ -19,6 +19,10 @@ src/blender_mcp/config.py
 projects/
 src/sdk/tests/artifacts/
 
+# Openverse credentials
+.credentials/
+
 # Whisper models cache
 .cache/
 notes_ignore/
+video_draft_mcp.egg-info
